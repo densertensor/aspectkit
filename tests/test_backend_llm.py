@@ -2,6 +2,7 @@
 
 import json
 import threading
+from typing import ClassVar
 
 import pytest
 
@@ -9,6 +10,7 @@ from aspectkit.backends.llm import LLMBackend
 from aspectkit.backends.parsing import extract_json, payload_to_polarity, payload_to_tuples
 from aspectkit.exceptions import LLMError, ParseError
 from aspectkit.llm.base import ChatLLM
+from aspectkit.llm.exemplars import NoneSelector
 from aspectkit.schema import ABSAExample, SentimentTuple, Span, is_implicit
 from aspectkit.tasks import get_task
 
@@ -224,6 +226,281 @@ class TestFewShot:
         fitted = LLMBackend(FakeChat([]), task="e2e", n_exemplars=3).fit(self.make_train(3))
         assert "exemplars=3" in repr(fitted)
         assert "exemplars=0" in repr(LLMBackend(FakeChat([]), task="e2e"))
+
+
+class TestExemplarSelection:
+    def make_train(self):
+        return [
+            ABSAExample(
+                text="the pizza was delicious",
+                tuples=[SentimentTuple(aspect=Span("pizza"), polarity="positive")],
+            ),
+            ABSAExample(
+                text="the waiter was rude and slow",
+                tuples=[SentimentTuple(aspect=Span("waiter"), polarity="negative")],
+            ),
+        ]
+
+    @staticmethod
+    def _exemplar_inputs(call):
+        # all user turns except the final one (the real query) are exemplar inputs
+        users = [m["content"] for m in call["messages"] if m["role"] == "user"]
+        return users[:-1]
+
+    def test_none_is_zero_shot(self):
+        llm = FakeChat(['{"tuples": []}'])
+        backend = LLMBackend(llm, task="e2e", exemplar_selection="none", n_exemplars=2)
+        backend.fit(self.make_train())
+        backend.predict([ABSAExample(text="great pizza here")])
+        assert self._exemplar_inputs(llm.calls[0]) == []
+
+    def test_random_reuses_one_sample_for_every_input(self):
+        llm = FakeChat(['{"tuples": []}', '{"tuples": []}'])
+        backend = LLMBackend(llm, task="e2e", n_exemplars=2)  # default is "random"
+        backend.fit(self.make_train())
+        backend.predict([ABSAExample(text="q1"), ABSAExample(text="q2")])
+        assert self._exemplar_inputs(llm.calls[0]) == self._exemplar_inputs(llm.calls[1])
+        assert len(self._exemplar_inputs(llm.calls[0])) == 2
+
+    def test_knn_retrieves_the_similar_exemplar(self):
+        llm = FakeChat(['{"tuples": []}'])
+        backend = LLMBackend(llm, task="e2e", exemplar_selection="knn", n_exemplars=1)
+        backend.fit(self.make_train())
+        backend.predict([ABSAExample(text="the pizza tasted amazing")])
+        assert self._exemplar_inputs(llm.calls[0]) == ["Text: the pizza was delicious"]
+
+    def test_knn_picks_per_input(self):
+        llm = FakeChat(['{"tuples": []}', '{"tuples": []}'])
+        backend = LLMBackend(llm, task="e2e", exemplar_selection="knn", n_exemplars=1)
+        backend.fit(self.make_train())
+        backend.predict(
+            [ABSAExample(text="amazing pizza"), ABSAExample(text="the waiter was so slow")]
+        )
+        assert self._exemplar_inputs(llm.calls[0]) == ["Text: the pizza was delicious"]
+        assert self._exemplar_inputs(llm.calls[1]) == ["Text: the waiter was rude and slow"]
+
+    def test_custom_selector_instance(self):
+        llm = FakeChat(['{"tuples": []}'])
+        backend = LLMBackend(llm, task="e2e", exemplar_selection=NoneSelector(), n_exemplars=2)
+        backend.fit(self.make_train())
+        backend.predict([ABSAExample(text="x")])
+        assert self._exemplar_inputs(llm.calls[0]) == []
+
+    def test_knn_classification_retrieves_similar(self):
+        llm = FakeChat(['{"polarity": "positive"}'])
+        backend = LLMBackend(llm, task="atsc", exemplar_selection="knn", n_exemplars=1)
+        backend.fit(self.make_train())
+        backend.predict(
+            [
+                ABSAExample(
+                    text="the pizza tasted amazing", tuples=[SentimentTuple(aspect=Span("pizza"))]
+                )
+            ]
+        )
+        users = [m["content"] for m in llm.calls[0]["messages"] if m["role"] == "user"]
+        assert any("the pizza was delicious" in u for u in users[:-1])
+
+    def test_invalid_string_rejected(self):
+        with pytest.raises(ValueError, match="exemplar_selection"):
+            LLMBackend(FakeChat([]), task="e2e", exemplar_selection="topk")
+
+    def test_invalid_type_rejected(self):
+        with pytest.raises(TypeError, match="exemplar_selection"):
+            LLMBackend(FakeChat([]), task="e2e", exemplar_selection=123)
+
+
+class TestPromptHooks:
+    def test_instructions_appended_to_system_prompt(self):
+        llm = FakeChat(['{"tuples": []}'])
+        LLMBackend(llm, task="e2e", instructions="Treat sarcasm as negative.").predict(
+            [ABSAExample(text=TEXT)]
+        )
+        system = llm.calls[0]["messages"][0]["content"]
+        assert system.endswith("Treat sarcasm as negative.")
+        assert "aspect-based sentiment analysis" in system  # base prompt still present
+
+    def test_system_prompt_fn_overrides(self):
+        llm = FakeChat(['{"tuples": []}'])
+        LLMBackend(llm, task="e2e", system_prompt_fn=lambda task, cats, pols: "CUSTOM").predict(
+            [ABSAExample(text=TEXT)]
+        )
+        assert llm.calls[0]["messages"][0]["content"] == "CUSTOM"
+
+    def test_override_plus_instructions(self):
+        llm = FakeChat(['{"tuples": []}'])
+        LLMBackend(
+            llm, task="e2e", system_prompt_fn=lambda *_: "BASE", instructions="EXTRA"
+        ).predict([ABSAExample(text=TEXT)])
+        assert llm.calls[0]["messages"][0]["content"] == "BASE\n\nEXTRA"
+
+    def test_system_prompt_fn_receives_config(self):
+        seen = {}
+
+        def fn(task, cats, pols):
+            seen.update(task=task.name, cats=cats, pols=pols)
+            return "X"
+
+        LLMBackend(FakeChat([]), task="acos", categories=["FOOD#QUALITY"], system_prompt_fn=fn)
+        assert seen == {
+            "task": "acos",
+            "cats": ["FOOD#QUALITY"],
+            "pols": ("positive", "negative", "neutral"),
+        }
+
+    def test_classification_instructions(self):
+        llm = FakeChat(['{"polarity": "positive"}'])
+        LLMBackend(llm, task="atsc", instructions="Domain: hotels.").predict(
+            [ABSAExample(text="nice room", tuples=[SentimentTuple(aspect=Span("room"))])]
+        )
+        assert llm.calls[0]["messages"][0]["content"].endswith("Domain: hotels.")
+
+    def test_prompt_preview_reflects_instructions_and_exemplars(self):
+        backend = LLMBackend(FakeChat([]), task="e2e", instructions="NOTE", n_exemplars=1)
+        backend.fit(
+            [
+                ABSAExample(
+                    text="train ex", tuples=[SentimentTuple(aspect=Span("ex"), polarity="positive")]
+                )
+            ]
+        )
+        preview = backend.prompt_preview("my input")
+        assert "NOTE" in preview and "train ex" in preview and "my input" in preview
+        assert "[system]" in preview and "[user]" in preview
+
+    def test_prompt_preview_classification(self):
+        preview = LLMBackend(FakeChat([]), task="atsc").prompt_preview("the food", aspect="food")
+        assert "food" in preview and "[system]" in preview
+
+    def test_prompt_preview_reflects_override(self):
+        backend = LLMBackend(FakeChat([]), task="e2e", system_prompt_fn=lambda *_: "OVERRIDDEN")
+        assert "OVERRIDDEN" in backend.prompt_preview("hi")
+
+
+class TestSelfConsistency:
+    A: ClassVar[dict[str, str]] = {"aspect": "pizza", "polarity": "positive"}
+    B: ClassVar[dict[str, str]] = {"aspect": "service", "polarity": "negative"}
+    C: ClassVar[dict[str, str]] = {"aspect": "price", "polarity": "neutral"}
+
+    def test_majority_vote_keeps_tuples_in_over_half(self):
+        llm = FakeChat(
+            [
+                json.dumps({"tuples": [self.A, self.B]}),
+                json.dumps({"tuples": [self.A, self.C]}),
+                json.dumps({"tuples": [self.A]}),
+            ]
+        )
+        backend = LLMBackend(llm, task="e2e", n_samples=3)
+        (pred,) = backend.predict([ABSAExample(text="x")])
+        assert sorted(t.aspect.text for t in pred) == ["pizza"]  # A in 3/3; B, C in 1/3 dropped
+        assert backend.diagnostics["calls"] == 3  # one call per sample
+
+    def test_majority_vote_with_implicit_aspect(self):
+        # Exercises tuple_key's IMPLICIT-vs-None distinction during voting.
+        impl = {"aspect": None, "polarity": "negative"}  # -> implicit aspect
+        llm = FakeChat(
+            [
+                json.dumps({"tuples": [impl]}),
+                json.dumps({"tuples": [impl]}),
+                json.dumps({"tuples": [self.A]}),
+            ]
+        )
+        backend = LLMBackend(llm, task="e2e", n_samples=3)
+        (pred,) = backend.predict([ABSAExample(text="x")], return_confidence=True)
+        assert len(pred) == 1  # implicit tuple wins 2/3; A at 1/3 dropped
+        tup, conf = pred[0]
+        assert is_implicit(tup.aspect) and conf == pytest.approx(2 / 3)
+
+    def test_union_vote_keeps_any_seen_tuple(self):
+        llm = FakeChat(
+            [
+                json.dumps({"tuples": [self.A, self.B]}),
+                json.dumps({"tuples": [self.A]}),
+                json.dumps({"tuples": [self.A]}),
+            ]
+        )
+        backend = LLMBackend(llm, task="e2e", n_samples=3, vote="union")
+        (pred,) = backend.predict([ABSAExample(text="x")])
+        assert sorted(t.aspect.text for t in pred) == ["pizza", "service"]
+
+    def test_duplicate_within_a_sample_counts_once(self):
+        # A repeated within one sample must not inflate its confidence past 1.0.
+        llm = FakeChat([json.dumps({"tuples": [self.A, self.A]}), json.dumps({"tuples": [self.A]})])
+        backend = LLMBackend(llm, task="e2e", n_samples=2, vote="union")
+        (pred,) = backend.predict([ABSAExample(text="x")], return_confidence=True)
+        assert [(t.aspect.text, c) for t, c in pred] == [("pizza", 1.0)]
+
+    def test_confidence_default_is_one(self):
+        llm = FakeChat([json.dumps({"tuples": [self.A]})])
+        (pred,) = LLMBackend(llm, task="e2e").predict(
+            [ABSAExample(text="x")], return_confidence=True
+        )
+        (tup, conf) = pred[0]
+        assert tup.aspect.text == "pizza" and conf == 1.0
+
+    def test_confidence_is_sample_fraction(self):
+        llm = FakeChat([json.dumps({"tuples": [self.A, self.B]}), json.dumps({"tuples": [self.A]})])
+        backend = LLMBackend(llm, task="e2e", n_samples=2, vote="union")
+        (pred,) = backend.predict([ABSAExample(text="x")], return_confidence=True)
+        conf = {t.aspect.text: c for t, c in pred}
+        assert conf == {"pizza": 1.0, "service": 0.5}
+
+    def test_return_confidence_false_strips_pairs(self):
+        llm = FakeChat([json.dumps({"tuples": [self.A]})])
+        (pred,) = LLMBackend(llm, task="e2e").predict([ABSAExample(text="x")])
+        assert pred[0].aspect.text == "pizza"  # bare SentimentTuple, not a pair
+
+    def test_classification_majority_polarity_and_confidence(self):
+        llm = FakeChat(
+            [
+                json.dumps({"polarity": "positive"}),
+                json.dumps({"polarity": "positive"}),
+                json.dumps({"polarity": "negative"}),
+            ]
+        )
+        backend = LLMBackend(llm, task="atsc", n_samples=3)
+        (pred,) = backend.predict(
+            [ABSAExample(text="x", tuples=[SentimentTuple(aspect=Span("food"))])],
+            return_confidence=True,
+        )
+        (tup, conf) = pred[0]
+        assert tup.polarity == "positive" and conf == pytest.approx(2 / 3)
+
+    def test_invalid_n_samples(self):
+        with pytest.raises(ValueError, match="n_samples"):
+            LLMBackend(FakeChat([]), task="e2e", n_samples=0)
+
+    def test_invalid_vote(self):
+        with pytest.raises(ValueError, match="vote"):
+            LLMBackend(FakeChat([]), task="e2e", vote="plurality")
+
+    def test_temperature_zero_warns(self):
+        class ColdChat(ChatLLM):
+            _temperature = 0.0
+
+            def complete(self, messages, *, max_tokens=1024, json_schema=None):
+                return '{"tuples": []}'
+
+        with pytest.warns(UserWarning, match="temperature"):
+            LLMBackend(ColdChat(), task="e2e", n_samples=3)
+
+    def test_temperature_warning_unwraps_connector(self):
+        from aspectkit.llm.wrappers import RetryingChat
+
+        class ColdChat(ChatLLM):
+            _temperature = 0.0
+
+            def complete(self, messages, *, max_tokens=1024, json_schema=None):
+                return '{"tuples": []}'
+
+        with pytest.warns(UserWarning, match="temperature"):
+            LLMBackend(RetryingChat(ColdChat()), task="e2e", n_samples=2)
+
+    def test_no_warning_when_temperature_unknown(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            LLMBackend(FakeChat([]), task="e2e", n_samples=3)  # FakeChat exposes no temperature
 
 
 class TestRepairAndErrors:

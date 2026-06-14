@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 from aspectkit.aggregate import AspectSummary
 from aspectkit.aggregate import summarize as _summarize
@@ -152,9 +152,33 @@ class ABSA:
         self.backend.fit(examples)
         return self
 
+    @overload
     def predict(
-        self, inputs: str | ABSAExample | Sequence[str | ABSAExample]
-    ) -> list[SentimentTuple] | list[list[SentimentTuple]]:
+        self,
+        inputs: str | ABSAExample | Sequence[str | ABSAExample],
+        *,
+        return_confidence: Literal[False] = False,
+    ) -> list[SentimentTuple] | list[list[SentimentTuple]]: ...
+
+    @overload
+    def predict(
+        self,
+        inputs: str | ABSAExample | Sequence[str | ABSAExample],
+        *,
+        return_confidence: Literal[True],
+    ) -> list[tuple[SentimentTuple, float]] | list[list[tuple[SentimentTuple, float]]]: ...
+
+    def predict(
+        self,
+        inputs: str | ABSAExample | Sequence[str | ABSAExample],
+        *,
+        return_confidence: bool = False,
+    ) -> (
+        list[SentimentTuple]
+        | list[list[SentimentTuple]]
+        | list[tuple[SentimentTuple, float]]
+        | list[list[tuple[SentimentTuple, float]]]
+    ):
         """Predict sentiment tuples.
 
         Args:
@@ -162,10 +186,15 @@ class ABSA:
                 with given elements (e.g. ATSC) need
                 :class:`~aspectkit.schema.ABSAExample` inputs carrying
                 the targets.
+            return_confidence: When ``True``, pair each predicted tuple with a
+                confidence in ``[0, 1]``.  Supported by the LLM backend
+                (via ``n_samples`` self-consistency); other backends raise
+                :class:`NotImplementedError`.
 
         Returns:
             For a single input, one list of tuples; for a sequence, one
-            list per input.
+            list per input.  With ``return_confidence`` each tuple becomes a
+            ``(tuple, confidence)`` pair.
         """
         single = isinstance(inputs, (str, ABSAExample))
         batch: Sequence[str | ABSAExample] = (
@@ -174,6 +203,14 @@ class ABSA:
         examples = [
             item if isinstance(item, ABSAExample) else ABSAExample(text=item) for item in batch
         ]
+        if return_confidence:
+            if not isinstance(self.backend, LLMBackend):
+                raise NotImplementedError(
+                    f"return_confidence is not supported by {type(self.backend).__name__}; "
+                    "use the LLM backend (PairClassifierBackend gains it in a later release)."
+                )
+            scored = self.backend.predict(examples, return_confidence=True)
+            return scored[0] if single else scored
         predictions = self.backend.predict(examples)
         return predictions[0] if single else predictions
 

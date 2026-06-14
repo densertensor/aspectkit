@@ -116,6 +116,23 @@ class TestPredict:
         absa = ABSA(task="acos", backend="llm", model=FakeChat([]))
         assert absa.fit([]) is absa
 
+    def test_return_confidence_single(self):
+        absa = ABSA(task="acos", backend="llm", model=FakeChat([ACOS_REPLY]))
+        pred = absa.predict(TEXT, return_confidence=True)
+        assert all(isinstance(conf, float) for _tup, conf in pred)
+        assert pred[0][1] == 1.0  # n_samples == 1 -> full confidence
+
+    def test_return_confidence_batch(self):
+        absa = ABSA(task="acos", backend="llm", model=FakeChat([ACOS_REPLY, ACOS_REPLY]))
+        out = absa.predict([TEXT, TEXT], return_confidence=True)
+        assert len(out) == 2
+        assert out[0][0][1] == 1.0  # first input, first (tuple, confidence) pair
+
+    def test_return_confidence_unsupported_backend_raises(self):
+        absa = ABSA(backend=RecordingBackend("aste", [[]]))
+        with pytest.raises(NotImplementedError, match="return_confidence"):
+            absa.predict("text", return_confidence=True)
+
 
 class TestEvaluate:
     def test_extraction_gold_is_hidden_from_backend(self):

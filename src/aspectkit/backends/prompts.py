@@ -190,17 +190,31 @@ def extraction_messages(
     categories: Sequence[str] | None,
     polarities: Sequence[str],
     exemplars: Sequence[ABSAExample] = (),
+    *,
+    extra_instructions: str | None = None,
+    system_prompt_override: str | None = None,
 ) -> list[Message]:
     """Build the chat messages for one extraction call.
 
     Few-shot exemplars are rendered as alternating user/assistant turns,
     each assistant turn being exactly the JSON the model should emit —
     the strongest format signal available to chat models.
+
+    Args:
+        extra_instructions: Appended to the system prompt as an extra block
+            (e.g. domain guidance), leaving the JSON contract intact.
+        system_prompt_override: Replaces the built-in system prompt entirely;
+            ``extra_instructions`` is still appended to it when both are given.
     """
     elements = task.ordered_elements(task.predicted)
-    messages: list[Message] = [
-        {"role": "system", "content": _extraction_system_prompt(task, categories, polarities)}
-    ]
+    system = (
+        system_prompt_override
+        if system_prompt_override is not None
+        else _extraction_system_prompt(task, categories, polarities)
+    )
+    if extra_instructions:
+        system = f"{system}\n\n{extra_instructions}"
+    messages: list[Message] = [{"role": "system", "content": system}]
     for exemplar in exemplars:
         payload = {"tuples": [tuple_to_payload(t, elements) for t in exemplar.tuples]}
         messages.append({"role": "user", "content": _render_extraction_input(exemplar.text)})
@@ -214,6 +228,9 @@ def classification_messages(
     aspect: str | None,
     polarities: Sequence[str],
     exemplars: Sequence[tuple[str, str | None, str]] = (),
+    *,
+    extra_instructions: str | None = None,
+    system_prompt_override: str | None = None,
 ) -> list[Message]:
     """Build the chat messages for one (text, aspect) polarity call.
 
@@ -222,10 +239,18 @@ def classification_messages(
         aspect: Surface text of the target aspect, or ``None`` if implicit.
         polarities: Allowed polarity labels.
         exemplars: Few-shot triples ``(text, aspect_or_None, polarity)``.
+        extra_instructions: Appended to the system prompt as an extra block.
+        system_prompt_override: Replaces the built-in system prompt entirely;
+            ``extra_instructions`` is still appended when both are given.
     """
-    messages: list[Message] = [
-        {"role": "system", "content": _classification_system_prompt(polarities)}
-    ]
+    system = (
+        system_prompt_override
+        if system_prompt_override is not None
+        else _classification_system_prompt(polarities)
+    )
+    if extra_instructions:
+        system = f"{system}\n\n{extra_instructions}"
+    messages: list[Message] = [{"role": "system", "content": system}]
     for ex_text, ex_aspect, ex_polarity in exemplars:
         messages.append(
             {"role": "user", "content": _render_classification_input(ex_text, ex_aspect)}

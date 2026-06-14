@@ -18,6 +18,13 @@ from __future__ import annotations
 
 from aspectkit.llm.anthropic import AnthropicChat
 from aspectkit.llm.base import CallableChat, ChatLLM, Message, split_system
+from aspectkit.llm.exemplars import (
+    ExemplarPool,
+    ExemplarSelector,
+    KNNSelector,
+    NoneSelector,
+    RandomSelector,
+)
 from aspectkit.llm.gemini import GeminiChat
 from aspectkit.llm.local import TransformersChat
 from aspectkit.llm.openai import OpenAIChat
@@ -31,9 +38,14 @@ __all__ = [
     "CallableChat",
     "ChatLLM",
     "CountingChat",
+    "ExemplarPool",
+    "ExemplarSelector",
     "GeminiChat",
+    "KNNSelector",
     "Message",
+    "NoneSelector",
     "OpenAIChat",
+    "RandomSelector",
     "RetryingChat",
     "TransformersChat",
     "resolve_llm",
