@@ -187,9 +187,9 @@ class ABSA:
                 :class:`~aspectkit.schema.ABSAExample` inputs carrying
                 the targets.
             return_confidence: When ``True``, pair each predicted tuple with a
-                confidence in ``[0, 1]``.  Supported by the LLM backend
-                (via ``n_samples`` self-consistency); other backends raise
-                :class:`NotImplementedError`.
+                confidence in ``[0, 1]``.  Supported by the LLM backend (via
+                ``n_samples`` self-consistency) and the pair backend (softmax
+                probability); other backends raise :class:`NotImplementedError`.
 
         Returns:
             For a single input, one list of tuples; for a sequence, one
@@ -204,10 +204,10 @@ class ABSA:
             item if isinstance(item, ABSAExample) else ABSAExample(text=item) for item in batch
         ]
         if return_confidence:
-            if not isinstance(self.backend, LLMBackend):
+            if not isinstance(self.backend, (LLMBackend, PairClassifierBackend)):
                 raise NotImplementedError(
                     f"return_confidence is not supported by {type(self.backend).__name__}; "
-                    "use the LLM backend (PairClassifierBackend gains it in a later release)."
+                    "use the LLM or pair backend."
                 )
             scored = self.backend.predict(examples, return_confidence=True)
             return scored[0] if single else scored

@@ -275,6 +275,15 @@ class TestPairClassifierRealPath:
         second = backend.predict([example])
         assert first == second
 
+    def test_return_confidence_in_unit_range(self, pair_classifier):
+        model, tokenizer = pair_classifier
+        backend = PairClassifierBackend(model, tokenizer=tokenizer, batch_size=2)
+        example = ABSAExample(text="good pasta", tuples=[SentimentTuple(aspect=Span("pasta"))])
+        (prediction,) = backend.predict([example], return_confidence=True)
+        (tup, conf) = prediction[0]
+        assert tup.polarity in ("positive", "negative", "neutral")
+        assert 0.0 <= conf <= 1.0
+
 
 PAIR_TRAIN = [
     ABSAExample(
@@ -290,8 +299,69 @@ PAIR_TRAIN = [
     ),
 ]
 
+PAIR_VAL = [
+    ABSAExample(
+        text="bad pasta", tuples=[SentimentTuple(aspect=Span("pasta"), polarity="negative")]
+    )
+]
+
 
 class TestPairClassifierFit:
+    def test_val_history_recorded(self, tmp_path):
+        model, tokenizer = _build_pair_classifier(tmp_path)
+        backend = PairClassifierBackend(model, tokenizer=tokenizer, batch_size=4)
+        backend.fit(PAIR_TRAIN, val_examples=PAIR_VAL, epochs=3, learning_rate=1e-3, seed=0)
+        assert len(backend.val_history_) == 3
+        assert all(v >= 0.0 for v in backend.val_history_)
+
+    def test_patience_early_stops(self, tmp_path):
+        model, tokenizer = _build_pair_classifier(tmp_path)
+        backend = PairClassifierBackend(model, tokenizer=tokenizer, batch_size=4)
+        # lr=0 freezes the weights: constant val loss -> no improvement -> early stop
+        backend.fit(
+            PAIR_TRAIN, val_examples=PAIR_VAL, epochs=20, learning_rate=0.0, patience=2, seed=0
+        )
+        assert len(backend.history_) == 3  # epoch 1 sets best; 2 & 3 stale -> stop
+        assert model.training is False
+
+    def test_patience_requires_val(self, tmp_path):
+        model, tokenizer = _build_pair_classifier(tmp_path)
+        backend = PairClassifierBackend(model, tokenizer=tokenizer)
+        with pytest.raises(ValueError, match="require val_examples"):
+            backend.fit(PAIR_TRAIN, patience=2)
+
+    def test_val_label_outside_model_rejected(self, tmp_path):
+        # validation labels are checked against id2label too, not just training ones
+        model, tokenizer = _build_pair_classifier(tmp_path)
+        backend = PairClassifierBackend(model, tokenizer=tokenizer)
+        bad_val = [
+            ABSAExample(
+                text="bad wine", tuples=[SentimentTuple(aspect=Span("wine"), polarity="conflict")]
+            )
+        ]
+        with pytest.raises(ValueError, match="id2label"):
+            backend.fit(PAIR_TRAIN, val_examples=bad_val)
+
+    def test_save_best_restores_lowest_val_loss_epoch(self, tmp_path):
+        m1, t1 = _build_pair_classifier(tmp_path / "a")
+        b1 = PairClassifierBackend(m1, tokenizer=t1, batch_size=4)
+        b1.fit(PAIR_TRAIN, val_examples=PAIR_VAL, epochs=20, learning_rate=0.2, seed=0)
+        best_epoch = b1.val_history_.index(min(b1.val_history_)) + 1
+        assert 1 <= best_epoch < 20  # an interior best -> save_best is meaningful
+
+        m2, t2 = _build_pair_classifier(tmp_path / "b")
+        b2 = PairClassifierBackend(m2, tokenizer=t2, batch_size=4)
+        b2.fit(PAIR_TRAIN, val_examples=PAIR_VAL, epochs=best_epoch, learning_rate=0.2, seed=0)
+
+        m3, t3 = _build_pair_classifier(tmp_path / "c")
+        b3 = PairClassifierBackend(m3, tokenizer=t3, batch_size=4)
+        b3.fit(
+            PAIR_TRAIN, val_examples=PAIR_VAL, epochs=20, learning_rate=0.2, save_best=True, seed=0
+        )
+        # save_best restored b3 to the best epoch == b2's final (same init + seeded trajectory)
+        for p2, p3 in zip(b2._model.parameters(), b3._model.parameters(), strict=True):
+            assert torch.equal(p2, p3)
+
     def test_fit_reduces_loss_and_restores_eval_mode(self, tmp_path):
         model, tokenizer = _build_pair_classifier(tmp_path)
         backend = PairClassifierBackend(model, tokenizer=tokenizer, batch_size=4)
@@ -369,8 +439,75 @@ SEQ2SEQ_TRAIN = [
     ),
 ]
 
+SEQ2SEQ_VAL = [
+    ABSAExample(
+        text="the wine was good",
+        tuples=[
+            SentimentTuple(
+                aspect=Span("wine", 4, 8),
+                category="FOOD#QUALITY",
+                opinion=Span("good", 13, 17),
+                polarity="positive",
+            )
+        ],
+    )
+]
+
 
 class TestSeq2SeqRealPath:
+    def test_val_history_recorded(self):
+        model, tokenizer = _build_seq2seq()
+        backend = Seq2SeqBackend(model, tokenizer=tokenizer, task="acos", batch_size=2)
+        backend.fit(SEQ2SEQ_TRAIN, val_examples=SEQ2SEQ_VAL, epochs=3, learning_rate=5e-3, seed=0)
+        assert len(backend.val_history_) == 3
+
+    def test_patience_early_stops(self):
+        model, tokenizer = _build_seq2seq()
+        backend = Seq2SeqBackend(model, tokenizer=tokenizer, task="acos", batch_size=2)
+        # lr=0 freezes the weights: constant val loss -> no improvement -> early stop
+        backend.fit(
+            SEQ2SEQ_TRAIN,
+            val_examples=SEQ2SEQ_VAL,
+            epochs=20,
+            learning_rate=0.0,
+            patience=2,
+            seed=0,
+        )
+        assert len(backend.history_) == 3
+        assert model.training is False
+
+    def test_patience_requires_val(self):
+        model, tokenizer = _build_seq2seq()
+        backend = Seq2SeqBackend(model, tokenizer=tokenizer, task="acos")
+        with pytest.raises(ValueError, match="require val_examples"):
+            backend.fit(SEQ2SEQ_TRAIN, save_best=True)
+
+    def test_save_best_restores_lowest_val_loss_epoch(self):
+        m1, t1 = _build_seq2seq()
+        b1 = Seq2SeqBackend(m1, tokenizer=t1, task="acos", batch_size=2)
+        b1.fit(SEQ2SEQ_TRAIN, val_examples=SEQ2SEQ_VAL, epochs=15, learning_rate=0.5, seed=0)
+        best_epoch = b1.val_history_.index(min(b1.val_history_)) + 1
+        assert 1 <= best_epoch < 15  # an interior best -> save_best is meaningful
+
+        m2, t2 = _build_seq2seq()
+        b2 = Seq2SeqBackend(m2, tokenizer=t2, task="acos", batch_size=2)
+        b2.fit(
+            SEQ2SEQ_TRAIN, val_examples=SEQ2SEQ_VAL, epochs=best_epoch, learning_rate=0.5, seed=0
+        )
+
+        m3, t3 = _build_seq2seq()
+        b3 = Seq2SeqBackend(m3, tokenizer=t3, task="acos", batch_size=2)
+        b3.fit(
+            SEQ2SEQ_TRAIN,
+            val_examples=SEQ2SEQ_VAL,
+            epochs=15,
+            learning_rate=0.5,
+            save_best=True,
+            seed=0,
+        )
+        for p2, p3 in zip(b2._model.parameters(), b3._model.parameters(), strict=True):
+            assert torch.equal(p2, p3)
+
     def test_predict_runs_end_to_end(self, seq2seq_lm):
         model, tokenizer = seq2seq_lm
         backend = Seq2SeqBackend(model, tokenizer=tokenizer, task="acos", max_target_length=24)

@@ -1,11 +1,18 @@
 """Tests for the pair-classifier backend, with duck-typed stubs."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
 
 from aspectkit.backends.pair import PairClassifierBackend
 from aspectkit.schema import IMPLICIT, ABSAExample, SentimentTuple, Span
+
+
+def _softmax_max(row):
+    """The largest softmax probability of a logit row (the chosen class's)."""
+    exps = [math.exp(x - max(row)) for x in row]
+    return max(exps) / sum(exps)
 
 
 class StubLogits:
@@ -103,11 +110,56 @@ class TestPredict:
         assert backend.diagnostics == {"n_implicit": 1, "pairs": 2}
 
 
+class TestConfidence:
+    def test_return_confidence_gives_softmax_prob(self):
+        backend = make_backend({"pasta": [0.1, 0.2, 0.9], "wine": [2.0, 0.0, 0.0]})
+        example = ABSAExample(
+            text="good pasta, bad wine",
+            tuples=[SentimentTuple(aspect=Span("pasta")), SentimentTuple(aspect=Span("wine"))],
+        )
+        (prediction,) = backend.predict([example], return_confidence=True)
+        (t0, c0), (t1, c1) = prediction
+        assert t0.polarity == "positive" and t1.polarity == "negative"
+        assert c0 == pytest.approx(_softmax_max([0.1, 0.2, 0.9]))
+        assert c1 == pytest.approx(_softmax_max([2.0, 0.0, 0.0]))
+        assert 0.0 <= c0 <= 1.0 and 0.0 <= c1 <= 1.0
+
+    def test_return_confidence_false_gives_bare_tuples(self):
+        backend = make_backend({"pasta": [0.1, 0.2, 0.9]})
+        example = ABSAExample(text="good pasta", tuples=[SentimentTuple(aspect=Span("pasta"))])
+        (prediction,) = backend.predict([example])  # default: no confidence
+        assert prediction[0].polarity == "positive"  # a bare SentimentTuple, not a pair
+
+    def test_confidence_preserves_given_elements(self):
+        backend = make_backend({"pasta": [0.1, 0.2, 0.9]})
+        example = ABSAExample(
+            text="good pasta",
+            tuples=[SentimentTuple(aspect=Span("pasta", 5, 10), category="FOOD#QUALITY")],
+        )
+        (prediction,) = backend.predict([example], return_confidence=True)
+        (tup, _conf) = prediction[0]
+        assert tup.aspect == Span("pasta", 5, 10) and tup.category == "FOOD#QUALITY"
+
+
 class TestLifecycle:
     def test_fit_rejects_unlabelled_examples(self):
         backend = make_backend({})
         with pytest.raises(ValueError, match="at least one"):
             backend.fit([ABSAExample(text="no labelled tuples here")])
+
+    def test_patience_with_unlabelled_val_rejected(self):
+        # a non-empty val_examples that yields no labelled pairs must not silently
+        # disable patience/save_best — it raises before any training begins.
+        backend = make_backend({})
+        train = [
+            ABSAExample(
+                text="good pasta",
+                tuples=[SentimentTuple(aspect=Span("pasta"), polarity="positive")],
+            )
+        ]
+        unlabelled_val = [ABSAExample(text="no labels", tuples=[SentimentTuple(aspect=Span("x"))])]
+        with pytest.raises(ValueError, match="labelled validation pairs"):
+            backend.fit(train, val_examples=unlabelled_val, patience=2)
 
     def test_model_object_without_tokenizer_rejected(self):
         with pytest.raises(TypeError, match="tokenizer"):

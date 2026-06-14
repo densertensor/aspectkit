@@ -10,6 +10,7 @@ from aspectkit.backends.llm import LLMBackend
 from aspectkit.backends.seq2seq import Seq2SeqBackend
 from aspectkit.tasks import get_task
 from tests.test_backend_llm import ACOS_REPLY, TEXT, FakeChat
+from tests.test_backend_pair import make_backend as make_pair_backend
 from tests.test_backend_seq2seq import ScriptedModel, ScriptedTokenizer
 
 
@@ -132,6 +133,15 @@ class TestPredict:
         absa = ABSA(backend=RecordingBackend("aste", [[]]))
         with pytest.raises(NotImplementedError, match="return_confidence"):
             absa.predict("text", return_confidence=True)
+
+    def test_return_confidence_pair_backend(self):
+        absa = ABSA(backend=make_pair_backend({"pasta": [0.1, 0.2, 0.9]}))
+        out = absa.predict(
+            ABSAExample(text="good pasta", tuples=[SentimentTuple(aspect=Span("pasta"))]),
+            return_confidence=True,
+        )
+        (tup, conf) = out[0]
+        assert tup.polarity == "positive" and 0.0 <= conf <= 1.0
 
 
 class TestEvaluate:

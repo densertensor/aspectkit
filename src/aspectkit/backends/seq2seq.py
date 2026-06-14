@@ -39,6 +39,26 @@ DEFAULT_CHECKPOINT = "t5-base"
 _STYLES = ("markers", "paraphrase")
 
 
+def _snapshot(model: Any) -> bytes:
+    """Serialise a model's parameters to an in-memory checkpoint."""
+    import io
+
+    import torch
+
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    return buffer.getvalue()
+
+
+def _restore(model: Any, blob: bytes) -> None:
+    """Load parameters saved by :func:`_snapshot` back into *model*."""
+    import io
+
+    import torch
+
+    model.load_state_dict(torch.load(io.BytesIO(blob), weights_only=True))
+
+
 class Seq2SeqBackend(Backend):
     """Tuple extraction with a fine-tuned encoder-decoder model.
 
@@ -124,6 +144,8 @@ class Seq2SeqBackend(Backend):
         self._hub_id: str | None = None
         #: Mean training loss per epoch from the most recent :meth:`fit`.
         self.history_: list[float] = []
+        #: Mean validation loss per epoch when ``fit(val_examples=...)`` is used.
+        self.val_history_: list[float] = []
         #: Counters from the most recent :meth:`predict` call.
         self.diagnostics: dict[str, int] = {}
 
@@ -152,6 +174,9 @@ class Seq2SeqBackend(Backend):
         max_grad_norm: float = 1.0,
         shuffle: bool = True,
         seed: int = 42,
+        val_examples: Sequence[ABSAExample] | None = None,
+        patience: int | None = None,
+        save_best: bool | None = None,
     ) -> Seq2SeqBackend:
         """Fine-tune the model to generate linearised gold tuples.
 
@@ -171,13 +196,26 @@ class Seq2SeqBackend(Backend):
             max_grad_norm: Gradient clipping threshold (0 disables).
             shuffle: Reshuffle examples every epoch (seeded).
             seed: Seed for shuffling and dropout reproducibility.
+            val_examples: Optional held-out examples; their mean per-epoch
+                loss is recorded in :attr:`val_history_`.  Required for
+                *patience* and *save_best*.
+            patience: Early-stop after this many epochs without a new best
+                validation loss (``None`` disables early stopping).
+            save_best: Keep an in-memory checkpoint of the lowest-val-loss
+                epoch and restore it at the end (``None``/``False`` keeps the
+                final epoch's weights).
 
         Returns:
             ``self``, for chaining.
         """
         if not examples:
             raise ValueError("fit needs at least one labelled example")
+        if (patience is not None or save_best) and not val_examples:
+            raise ValueError("patience= and save_best= require val_examples=")
         pairs = [(e.text, self.template.encode(e.tuples)) for e in examples]
+        val_pairs = (
+            [(e.text, self.template.encode(e.tuples)) for e in val_examples] if val_examples else []
+        )
         self._ensure_loaded()
         try:
             import torch
@@ -196,6 +234,10 @@ class Seq2SeqBackend(Backend):
         pad_id = tokenizer.pad_token_id
 
         self.history_ = []
+        self.val_history_ = []
+        best_val = float("inf")
+        best_state: bytes | None = None
+        stale_epochs = 0
         model.train()
         try:
             for _ in range(epochs):
@@ -204,27 +246,8 @@ class Seq2SeqBackend(Backend):
                     rng.shuffle(order)
                 total, n_batches = 0.0, 0
                 for offset in range(0, len(order), batch):
-                    chunk = order[offset : offset + batch]
-                    encoded = tokenizer(
-                        [pairs[i][0] for i in chunk],
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_source_length,
-                        return_tensors="pt",
-                    )
-                    labels = tokenizer(
-                        text_target=[pairs[i][1] for i in chunk],
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_target_length,
-                        return_tensors="pt",
-                    ).input_ids
-                    if pad_id is not None:
-                        labels[labels == pad_id] = -100  # ignored by the loss
-                    if device is not None:
-                        encoded = encoded.to(device)
-                        labels = labels.to(device)
-                    loss = model(**encoded, labels=labels).loss
+                    chunk = [pairs[i] for i in order[offset : offset + batch]]
+                    loss = self._batch_loss(chunk, device, pad_id)
                     optimizer.zero_grad()
                     loss.backward()
                     if max_grad_norm:
@@ -233,9 +256,70 @@ class Seq2SeqBackend(Backend):
                     total += float(loss.detach())
                     n_batches += 1
                 self.history_.append(total / n_batches)
+
+                if not val_pairs:
+                    continue
+                val_loss = self._validation_loss(val_pairs, batch, device, pad_id)
+                self.val_history_.append(val_loss)
+                if val_loss < best_val:
+                    best_val = val_loss
+                    stale_epochs = 0
+                    if save_best:
+                        best_state = _snapshot(model)
+                else:
+                    stale_epochs += 1
+                    if patience is not None and stale_epochs >= patience:
+                        break
         finally:
             model.eval()
+        if best_state is not None:
+            _restore(model, best_state)
         return self
+
+    def _batch_loss(
+        self, batch_pairs: list[tuple[str, str]], device: Any, pad_id: int | None
+    ) -> Any:
+        """Encoder-decoder loss for one batch of (text, target) pairs."""
+        model, tokenizer = self._model, self._tokenizer
+        assert model is not None and tokenizer is not None  # set by _ensure_loaded
+        encoded = tokenizer(
+            [text for text, _ in batch_pairs],
+            padding=True,
+            truncation=True,
+            max_length=self.max_source_length,
+            return_tensors="pt",
+        )
+        labels = tokenizer(
+            text_target=[target for _, target in batch_pairs],
+            padding=True,
+            truncation=True,
+            max_length=self.max_target_length,
+            return_tensors="pt",
+        ).input_ids
+        if pad_id is not None:
+            labels[labels == pad_id] = -100  # ignored by the loss
+        if device is not None:
+            encoded = encoded.to(device)
+            labels = labels.to(device)
+        return model(**encoded, labels=labels).loss
+
+    def _validation_loss(
+        self, val_pairs: list[tuple[str, str]], batch: int, device: Any, pad_id: int | None
+    ) -> float:
+        """Mean per-batch loss over held-out pairs (eval mode, no grad)."""
+        model = self._model
+        assert model is not None
+        model.eval()
+        total, n_batches = 0.0, 0
+        try:
+            with self._no_grad():
+                for offset in range(0, len(val_pairs), batch):
+                    loss = self._batch_loss(val_pairs[offset : offset + batch], device, pad_id)
+                    total += float(loss)
+                    n_batches += 1
+        finally:
+            model.train()
+        return total / n_batches if n_batches else 0.0
 
     # --------------------------------------------------------------- predict
 

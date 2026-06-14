@@ -10,13 +10,14 @@ SemEval+MAMS data and gives a strong zero-config starting point.
 
 from __future__ import annotations
 
+import math
 import random
 import warnings
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 from aspectkit.backends.base import Backend
 from aspectkit.exceptions import MissingDependencyError
@@ -27,6 +28,34 @@ from aspectkit.tasks import get_task
 __all__ = ["PairClassifierBackend"]
 
 DEFAULT_CHECKPOINT = "yangheng/deberta-v3-base-absa-v1.1"
+
+
+def _softmax(row: list[float]) -> list[float]:
+    """Numerically-stable softmax of a logit row (stdlib only)."""
+    hi = max(row)
+    exps = [math.exp(value - hi) for value in row]
+    total = sum(exps)
+    return [value / total for value in exps]
+
+
+def _snapshot(model: Any) -> bytes:
+    """Serialise a model's parameters to an in-memory checkpoint."""
+    import io
+
+    import torch
+
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    return buffer.getvalue()
+
+
+def _restore(model: Any, blob: bytes) -> None:
+    """Load parameters saved by :func:`_snapshot` back into *model*."""
+    import io
+
+    import torch
+
+    model.load_state_dict(torch.load(io.BytesIO(blob), weights_only=True))
 
 
 class PairClassifierBackend(Backend):
@@ -62,6 +91,8 @@ class PairClassifierBackend(Backend):
         self._hub_id: str | None = None
         #: Mean training loss per epoch from the most recent :meth:`fit`.
         self.history_: list[float] = []
+        #: Mean validation loss per epoch when ``fit(val_examples=...)`` is used.
+        self.val_history_: list[float] = []
         #: Counters from the most recent :meth:`predict` call.
         self.diagnostics: dict[str, int] = {}
 
@@ -89,6 +120,9 @@ class PairClassifierBackend(Backend):
         max_grad_norm: float = 1.0,
         shuffle: bool = True,
         seed: int = 42,
+        val_examples: Sequence[ABSAExample] | None = None,
+        patience: int | None = None,
+        save_best: bool | None = None,
     ) -> PairClassifierBackend:
         """Fine-tune the cross-encoder on labelled (text, aspect) pairs.
 
@@ -108,6 +142,14 @@ class PairClassifierBackend(Backend):
             max_grad_norm: Gradient clipping threshold (0 disables).
             shuffle: Reshuffle pairs every epoch (seeded).
             seed: Seed for shuffling and dropout reproducibility.
+            val_examples: Optional held-out examples; their mean per-epoch
+                loss is recorded in :attr:`val_history_`.  Required for
+                *patience* and *save_best*.
+            patience: Early-stop after this many epochs without a new best
+                validation loss (``None`` disables early stopping).
+            save_best: Keep an in-memory checkpoint of the lowest-val-loss
+                epoch and restore it at the end (``None``/``False`` keeps the
+                final epoch's weights).
 
         Returns:
             ``self``, for chaining.
@@ -118,17 +160,9 @@ class PairClassifierBackend(Backend):
                 ``id2label`` config (instantiate the model with matching
                 ``num_labels``/``id2label`` in that case).
         """
-        pairs: list[tuple[str, str, str]] = []
-        n_implicit = 0
-        for example in examples:
-            for t in example.tuples:
-                if t.polarity is None:
-                    continue
-                if isinstance(t.aspect, Span):
-                    pairs.append((example.text, t.aspect.text, t.polarity))
-                else:
-                    n_implicit += 1
-                    pairs.append((example.text, "", t.polarity))
+        if (patience is not None or save_best) and not val_examples:
+            raise ValueError("patience= and save_best= require val_examples=")
+        pairs, n_implicit = self._build_pairs(examples)
         if not pairs:
             raise ValueError("fit needs at least one tuple with an aspect and a polarity")
         if n_implicit:
@@ -136,6 +170,12 @@ class PairClassifierBackend(Backend):
                 f"{n_implicit} implicit aspect(s) trained against an empty target, "
                 "matching predict()'s convention",
                 stacklevel=2,
+            )
+        val_pairs = self._build_pairs(val_examples)[0] if val_examples else []
+        if (patience is not None or save_best) and not val_pairs:
+            raise ValueError(
+                "patience= and save_best= need labelled validation pairs, but val_examples "
+                "produced none (no val tuple has both an aspect and a polarity)"
             )
 
         self._ensure_loaded()
@@ -154,7 +194,8 @@ class PairClassifierBackend(Backend):
                 label_to_id[canonical_polarity(label)] = int(index)
             except ValueError:
                 continue
-        unmapped = sorted({polarity for _, _, polarity in pairs} - set(label_to_id))
+        all_polarities = {p for _, _, p in pairs} | {p for _, _, p in val_pairs}
+        unmapped = sorted(all_polarities - set(label_to_id))
         if unmapped:
             raise ValueError(
                 f"training labels {unmapped} have no counterpart in the model's id2label "
@@ -171,6 +212,10 @@ class PairClassifierBackend(Backend):
         )
 
         self.history_ = []
+        self.val_history_ = []
+        best_val = float("inf")
+        best_state: bytes | None = None
+        stale_epochs = 0
         model.train()
         try:
             for _ in range(epochs):
@@ -180,19 +225,7 @@ class PairClassifierBackend(Backend):
                 total, n_batches = 0.0, 0
                 for offset in range(0, len(order), batch):
                     chunk = [pairs[i] for i in order[offset : offset + batch]]
-                    encoded = tokenizer(
-                        [text for text, _, _ in chunk],
-                        [aspect for _, aspect, _ in chunk],
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_length,
-                        return_tensors="pt",
-                    )
-                    labels = torch.tensor([label_to_id[polarity] for _, _, polarity in chunk])
-                    if device is not None:
-                        encoded = encoded.to(device)
-                        labels = labels.to(device)
-                    loss = model(**encoded, labels=labels).loss
+                    loss = self._batch_loss(chunk, device, label_to_id)
                     optimizer.zero_grad()
                     loss.backward()
                     if max_grad_norm:
@@ -201,9 +234,90 @@ class PairClassifierBackend(Backend):
                     total += float(loss.detach())
                     n_batches += 1
                 self.history_.append(total / n_batches)
+
+                if not val_pairs:
+                    continue
+                val_loss = self._validation_loss(val_pairs, batch, device, label_to_id)
+                self.val_history_.append(val_loss)
+                if val_loss < best_val:
+                    best_val = val_loss
+                    stale_epochs = 0
+                    if save_best:
+                        best_state = _snapshot(model)
+                else:
+                    stale_epochs += 1
+                    if patience is not None and stale_epochs >= patience:
+                        break
         finally:
             model.eval()
+        if best_state is not None:
+            _restore(model, best_state)
         return self
+
+    def _build_pairs(
+        self, examples: Sequence[ABSAExample]
+    ) -> tuple[list[tuple[str, str, str]], int]:
+        """Flatten labelled tuples into (text, aspect, polarity) pairs.
+
+        Implicit aspects pair with the empty string (matching
+        :meth:`predict`); the count of those is returned alongside.
+        """
+        pairs: list[tuple[str, str, str]] = []
+        n_implicit = 0
+        for example in examples:
+            for t in example.tuples:
+                if t.polarity is None:
+                    continue
+                if isinstance(t.aspect, Span):
+                    pairs.append((example.text, t.aspect.text, t.polarity))
+                else:
+                    n_implicit += 1
+                    pairs.append((example.text, "", t.polarity))
+        return pairs, n_implicit
+
+    def _batch_loss(
+        self, batch_pairs: list[tuple[str, str, str]], device: Any, label_to_id: dict[str, int]
+    ) -> Any:
+        """Classification loss for one batch of (text, aspect, polarity) pairs."""
+        import torch
+
+        model, tokenizer = self._model, self._tokenizer
+        assert model is not None and tokenizer is not None  # set by _ensure_loaded
+        encoded = tokenizer(
+            [text for text, _, _ in batch_pairs],
+            [aspect for _, aspect, _ in batch_pairs],
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        labels = torch.tensor([label_to_id[polarity] for _, _, polarity in batch_pairs])
+        if device is not None:
+            encoded = encoded.to(device)
+            labels = labels.to(device)
+        return model(**encoded, labels=labels).loss
+
+    def _validation_loss(
+        self,
+        val_pairs: list[tuple[str, str, str]],
+        batch: int,
+        device: Any,
+        label_to_id: dict[str, int],
+    ) -> float:
+        """Mean per-batch loss over held-out pairs (eval mode, no grad)."""
+        model = self._model
+        assert model is not None
+        model.eval()
+        total, n_batches = 0.0, 0
+        try:
+            with self._no_grad():
+                for offset in range(0, len(val_pairs), batch):
+                    loss = self._batch_loss(val_pairs[offset : offset + batch], device, label_to_id)
+                    total += float(loss)
+                    n_batches += 1
+        finally:
+            model.train()
+        return total / n_batches if n_batches else 0.0
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Save the (fine-tuned) model and tokenizer to *directory*.
@@ -250,14 +364,14 @@ class PairClassifierBackend(Backend):
         except (AttributeError, StopIteration, TypeError):
             return None
 
-    def _classify_pairs(self, pairs: list[tuple[str, str]]) -> list[str]:
-        """Classify (text, aspect) pairs, returning canonical polarities."""
+    def _classify_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, float]]:
+        """Classify (text, aspect) pairs into (polarity, softmax probability)."""
         self._ensure_loaded()
         model, tokenizer = self._model, self._tokenizer
         assert model is not None and tokenizer is not None  # set by _ensure_loaded
         id2label = dict(getattr(model.config, "id2label", {}))
         device = self._tensor_device()
-        results: list[str] = []
+        results: list[tuple[str, float]] = []
         for offset in range(0, len(pairs), self.batch_size):
             batch = pairs[offset : offset + self.batch_size]
             encoded = tokenizer(
@@ -275,15 +389,29 @@ class PairClassifierBackend(Backend):
             for row in logits.tolist():
                 index = max(range(len(row)), key=row.__getitem__)
                 label = id2label.get(index, str(index))
-                results.append(canonical_polarity(label))
+                results.append((canonical_polarity(label), _softmax(row)[index]))
         return results
 
-    def predict(self, examples: Sequence[ABSAExample]) -> list[list[SentimentTuple]]:
+    @overload
+    def predict(
+        self, examples: Sequence[ABSAExample], *, return_confidence: Literal[False] = False
+    ) -> list[list[SentimentTuple]]: ...
+
+    @overload
+    def predict(
+        self, examples: Sequence[ABSAExample], *, return_confidence: Literal[True]
+    ) -> list[list[tuple[SentimentTuple, float]]]: ...
+
+    def predict(
+        self, examples: Sequence[ABSAExample], *, return_confidence: bool = False
+    ) -> list[list[SentimentTuple]] | list[list[tuple[SentimentTuple, float]]]:
         """Classify the polarity of every given aspect in every example.
 
         Implicit aspects are classified against the empty string (the
         model judges the sentence as a whole), with a warning: pair
-        classifiers are trained on explicit targets.
+        classifiers are trained on explicit targets.  With
+        ``return_confidence=True`` each tuple is paired with the model's
+        softmax probability for the chosen polarity.
         """
         self._require_given_elements(examples)
 
@@ -307,11 +435,17 @@ class PairClassifierBackend(Backend):
             )
 
         self.diagnostics = {"n_implicit": n_implicit, "pairs": len(pairs)}
-        polarities = iter(self._classify_pairs(pairs))
-        predictions: list[list[SentimentTuple]] = []
+        scored = iter(self._classify_pairs(pairs))
+        predictions: list[list[tuple[SentimentTuple, float]]] = []
         for targets in layout:
-            predictions.append([replace(target, polarity=next(polarities)) for target in targets])
-        return predictions
+            row: list[tuple[SentimentTuple, float]] = []
+            for target in targets:
+                polarity, prob = next(scored)
+                row.append((replace(target, polarity=polarity), prob))
+            predictions.append(row)
+        if return_confidence:
+            return predictions
+        return [[t for t, _prob in row] for row in predictions]
 
     def __repr__(self) -> str:
         return f"PairClassifierBackend(model={self.model_name!r})"
