@@ -59,3 +59,4 @@ outputs/
 
 # --- local working notes, not part of the package ---
 ctx/
+AGENTS.md
