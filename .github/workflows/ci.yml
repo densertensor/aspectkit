@@ -46,3 +46,21 @@ jobs:
           pip install -e ".[dev]" transformers openai anthropic google-genai pandas
       - name: Test
         run: python -m pytest
+
+  package:
+    name: build & metadata check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and check distributions
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Confirm py.typed is packaged
+        run: python -m zipfile -l dist/*.whl | grep -q "aspectkit/py.typed"
+      - name: Confirm the sdist ships no internal docs/CI
+        run: "! tar tzf dist/*.tar.gz | grep -E 'docs/|[.]github/'"
