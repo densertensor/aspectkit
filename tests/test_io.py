@@ -2,9 +2,11 @@
 
 import pytest
 
+from aspectkit.backends.base import Backend
 from aspectkit.exceptions import DataFormatError
 from aspectkit.io import (
     load_examples,
+    predict_with_checkpoint,
     read_acos,
     read_aste,
     read_jsonl,
@@ -293,3 +295,147 @@ class TestLoadExamples:
     def test_unknown_format(self, tmp_path):
         with pytest.raises(ValueError, match="unknown format"):
             load_examples(tmp_path / "x", "parquet")
+
+
+class _RecordingBackend(Backend):
+    """Echoes each example's text as the predicted aspect; records the calls."""
+
+    def __init__(self) -> None:
+        self.seen_ids: list[list[str | None]] = []
+
+    def predict(self, examples):
+        self.seen_ids.append([e.id for e in examples])
+        return [[SentimentTuple(aspect=Span(e.text))] for e in examples]
+
+
+class TestWriteJsonlAppend:
+    def test_append_adds_lines(self, tmp_path):
+        path = tmp_path / "a.jsonl"
+        write_jsonl([ABSAExample(text="a", id="1")], path)
+        write_jsonl([ABSAExample(text="b", id="2")], path, append=True)
+        assert [e.id for e in read_jsonl(path)] == ["1", "2"]
+
+    def test_default_overwrites(self, tmp_path):
+        path = tmp_path / "o.jsonl"
+        write_jsonl([ABSAExample(text="a", id="1")], path)
+        write_jsonl([ABSAExample(text="b", id="2")], path)
+        assert [e.id for e in read_jsonl(path)] == ["2"]
+
+    def test_append_creates_missing_file(self, tmp_path):
+        path = tmp_path / "new.jsonl"
+        write_jsonl([ABSAExample(text="a", id="1")], path, append=True)
+        assert [e.id for e in read_jsonl(path)] == ["1"]
+
+
+class TestCheckpoint:
+    @staticmethod
+    def _examples(n):
+        return [ABSAExample(text=f"t{i}", id=f"id{i}") for i in range(n)]
+
+    def test_fresh_run_writes_and_returns_in_order(self, tmp_path):
+        backend = _RecordingBackend()
+        path = tmp_path / "ckpt.jsonl"
+        out = predict_with_checkpoint(backend, self._examples(3), path)
+        assert backend.seen_ids == [["id0", "id1", "id2"]]
+        assert [t[0].aspect.text for t in out] == ["t0", "t1", "t2"]
+        assert {e.id for e in read_jsonl(path)} == {"id0", "id1", "id2"}
+
+    def test_resume_skips_done_and_merges_in_order(self, tmp_path):
+        path = tmp_path / "ckpt.jsonl"
+        # a prior run completed id0 and id2 (out of order, with distinct cached text)
+        write_jsonl(
+            [
+                ABSAExample(text="t0", tuples=[SentimentTuple(aspect=Span("cached0"))], id="id0"),
+                ABSAExample(text="t2", tuples=[SentimentTuple(aspect=Span("cached2"))], id="id2"),
+            ],
+            path,
+        )
+        backend = _RecordingBackend()
+        out = predict_with_checkpoint(backend, self._examples(4), path)
+        assert backend.seen_ids == [["id1", "id3"]]  # only the missing ids predicted
+        assert [t[0].aspect.text for t in out] == ["cached0", "t1", "cached2", "t3"]
+        assert {e.id for e in read_jsonl(path)} == {"id0", "id1", "id2", "id3"}  # appended
+
+    def test_all_done_predicts_nothing(self, tmp_path):
+        path = tmp_path / "ckpt.jsonl"
+        predict_with_checkpoint(_RecordingBackend(), self._examples(2), path)
+        backend = _RecordingBackend()
+        out = predict_with_checkpoint(backend, self._examples(2), path)
+        assert backend.seen_ids == []  # nothing left to predict
+        assert [t[0].aspect.text for t in out] == ["t0", "t1"]
+
+    def test_overwrite_discards_existing(self, tmp_path):
+        path = tmp_path / "ckpt.jsonl"
+        predict_with_checkpoint(_RecordingBackend(), self._examples(2), path)
+        backend = _RecordingBackend()
+        predict_with_checkpoint(backend, self._examples(2), path, overwrite=True)
+        assert backend.seen_ids == [["id0", "id1"]]  # re-predicted from scratch
+
+    def test_resumes_after_midrun_crash_with_batches(self, tmp_path):
+        path = tmp_path / "ckpt.jsonl"
+        examples = self._examples(6)
+
+        class CrashAfterFirstBatch(Backend):
+            def __init__(self):
+                self.batches = 0
+
+            def predict(self, batch):
+                self.batches += 1
+                if self.batches > 1:
+                    raise RuntimeError("simulated mid-run crash")
+                return [[SentimentTuple(aspect=Span(e.text))] for e in batch]
+
+        with pytest.raises(RuntimeError):
+            predict_with_checkpoint(CrashAfterFirstBatch(), examples, path, batch_size=2)
+        assert {e.id for e in read_jsonl(path)} == {"id0", "id1"}  # first batch persisted
+
+        backend = _RecordingBackend()
+        out = predict_with_checkpoint(backend, examples, path, batch_size=2)
+        assert backend.seen_ids == [["id2", "id3"], ["id4", "id5"]]  # only the rest, batched
+        assert [t[0].aspect.text for t in out] == ["t0", "t1", "t2", "t3", "t4", "t5"]
+
+    def test_empty_examples_returns_empty(self, tmp_path):
+        backend = _RecordingBackend()
+        assert predict_with_checkpoint(backend, [], tmp_path / "c.jsonl") == []
+        assert backend.seen_ids == []  # backend.predict never called
+
+    def test_recovers_from_torn_trailing_line(self, tmp_path):
+        path = tmp_path / "ckpt.jsonl"
+        write_jsonl(
+            [ABSAExample(text="t0", tuples=[SentimentTuple(aspect=Span("cached0"))], id="id0")],
+            path,
+        )
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('{"text": "t1", "tup')  # truncated append, as a hard kill leaves
+        backend = _RecordingBackend()
+        with pytest.warns(UserWarning, match="truncated"):
+            out = predict_with_checkpoint(backend, self._examples(2), path)
+        assert backend.seen_ids == [["id1"]]  # id0 recovered; only the torn id1 re-predicted
+        assert [t[0].aspect.text for t in out] == ["cached0", "t1"]
+        # the checkpoint was compacted + reappended cleanly: a fresh resume needs no work
+        backend2 = _RecordingBackend()
+        out2 = predict_with_checkpoint(backend2, self._examples(2), path)
+        assert backend2.seen_ids == []
+        assert [t[0].aspect.text for t in out2] == ["cached0", "t1"]
+
+    def test_corrupt_nonfinal_line_raises(self, tmp_path):
+        path = tmp_path / "ckpt.jsonl"
+        # a malformed line FOLLOWED by a valid one is genuine corruption, not a torn tail
+        path.write_text('garbage\n{"text": "t0", "tuples": [], "id": "id0"}\n', encoding="utf-8")
+        with pytest.raises(DataFormatError):
+            predict_with_checkpoint(_RecordingBackend(), self._examples(1), path)
+
+    def test_requires_ids(self, tmp_path):
+        with pytest.raises(ValueError, match="id"):
+            predict_with_checkpoint(_RecordingBackend(), [ABSAExample(text="x")], tmp_path / "c")
+
+    def test_rejects_duplicate_ids(self, tmp_path):
+        examples = [ABSAExample(text="a", id="dup"), ABSAExample(text="b", id="dup")]
+        with pytest.raises(ValueError, match="unique"):
+            predict_with_checkpoint(_RecordingBackend(), examples, tmp_path / "c")
+
+    def test_rejects_bad_batch_size(self, tmp_path):
+        with pytest.raises(ValueError, match="batch_size"):
+            predict_with_checkpoint(
+                _RecordingBackend(), self._examples(1), tmp_path / "c", batch_size=0
+            )

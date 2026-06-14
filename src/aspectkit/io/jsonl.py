@@ -42,11 +42,19 @@ def read_jsonl(path: str | Path) -> list[ABSAExample]:
     return examples
 
 
-def write_jsonl(examples: Iterable[ABSAExample], path: str | Path) -> None:
-    """Write examples to a JSON-Lines file (UTF-8, one example per line)."""
+def write_jsonl(examples: Iterable[ABSAExample], path: str | Path, *, append: bool = False) -> None:
+    """Write examples to a JSON-Lines file (UTF-8, one example per line).
+
+    Args:
+        examples: Examples to serialise.
+        path: Destination file (its parent directory is created if absent).
+        append: If ``True``, append to *path* instead of overwriting it
+            (creating it if absent) — the basis for resumable corpus runs.
+            The default overwrites, matching prior behaviour.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    with path.open("a" if append else "w", encoding="utf-8") as handle:
         for example in examples:
             handle.write(json.dumps(example.to_dict(), ensure_ascii=False))
             handle.write("\n")

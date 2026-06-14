@@ -26,6 +26,8 @@ Custom data and framework interop:
 * :func:`from_records` / :func:`from_pandas` / :func:`from_hf_dataset` —
   in-memory conversion from dicts, DataFrames, or Hugging Face datasets.
 * :func:`to_records` / :func:`to_pandas` — export back out for analysis.
+* :func:`predict_with_checkpoint` — run a backend over a corpus with an
+  on-disk checkpoint so an interrupted run resumes without re-predicting.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from aspectkit.io.acos import read_acos
 from aspectkit.io.asqp import read_asqp
 from aspectkit.io.aste import read_aste
 from aspectkit.io.bio import read_bio
+from aspectkit.io.checkpoint import predict_with_checkpoint
 from aspectkit.io.jsonl import read_jsonl, write_jsonl
 from aspectkit.io.records import (
     from_hf_dataset,
@@ -55,6 +58,7 @@ __all__ = [
     "from_pandas",
     "from_records",
     "load_examples",
+    "predict_with_checkpoint",
     "read_acos",
     "read_asqp",
     "read_aste",
