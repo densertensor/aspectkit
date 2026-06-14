@@ -5,14 +5,14 @@ All expected values are hand-computed.
 
 import pytest
 
-from aspectkit.evaluation import evaluate
+from aspectkit.evaluation import EvaluationReport, evaluate
 from aspectkit.evaluation.matching import (
     count_exact_matches,
     count_overlap_matches,
     element_key,
     tuple_key,
 )
-from aspectkit.evaluation.metrics import classification_scores, tuple_prf
+from aspectkit.evaluation.metrics import PRF, classification_scores, tuple_prf
 from aspectkit.schema import IMPLICIT, ABSAExample, SentimentTuple, Span
 
 
@@ -247,3 +247,57 @@ class TestEvaluate:
         gold = [ABSAExample(text="x", tuples=[t("a", polarity="positive")])]
         report = evaluate(gold, [[t("a", polarity="positive")]], "e2e")
         json.dumps(report.to_dict())
+
+
+class TestToMethodsText:
+    def test_extraction_paragraph(self):
+        report = EvaluationReport(
+            task="acos",
+            kind="extraction",
+            n_examples=100,
+            elements=("aspect", "category", "opinion", "polarity"),
+            exact=PRF.from_counts(48, 60, 100),
+            lenient=PRF.from_counts(55, 60, 100),
+        )
+        text = report.to_methods_text(model_name="GPT-X (zero-shot)", dataset_name="Rest16")
+        assert "GPT-X (zero-shot)" in text and "Rest16" in text and "acos" in text
+        assert f"{48 / 60:.3f}" in text  # exact precision
+        assert "lenient" in text.lower()
+
+    def test_classification_paragraph(self):
+        scores = classification_scores(["positive", "negative"], ["positive", "positive"])
+        report = EvaluationReport(
+            task="atsc",
+            kind="classification",
+            n_examples=2,
+            elements=("polarity",),
+            classification=scores,
+        )
+        text = report.to_methods_text(model_name="DeBERTa", dataset_name="MAMS")
+        assert "accuracy" in text.lower() and "DeBERTa" in text and "MAMS" in text
+        assert f"{scores.accuracy:.3f}" in text
+
+    def test_template_override(self):
+        report = EvaluationReport(
+            task="e2e",
+            kind="extraction",
+            n_examples=10,
+            elements=("aspect", "polarity"),
+            exact=PRF.from_counts(5, 10, 10),
+        )
+        text = report.to_methods_text(
+            model_name="M", dataset_name="D", template="{model_name}|{task}|F1={f1}"
+        )
+        assert text == "M|e2e|F1=0.500"
+
+    def test_no_model_identity_claims(self):
+        # the paragraph must only use the names the caller supplies, verbatim
+        report = EvaluationReport(
+            task="e2e",
+            kind="extraction",
+            n_examples=1,
+            elements=("aspect",),
+            exact=PRF.from_counts(1, 1, 1),
+        )
+        text = report.to_methods_text(model_name="<MODEL>", dataset_name="<DATA>")
+        assert "<MODEL>" in text and "<DATA>" in text

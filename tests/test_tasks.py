@@ -7,7 +7,23 @@ from aspectkit.tasks import ELEMENTS, TASKS, Task, get_task
 
 class TestRegistry:
     def test_all_standard_tasks_present(self):
-        assert set(TASKS) == {"ate", "atsc", "acd", "acsa", "e2e", "aste", "tasd", "acos"}
+        assert set(TASKS) == {
+            "ate",
+            "atsc",
+            "acd",
+            "acsa",
+            "e2e",
+            "aste",
+            "tasd",
+            "acos",
+            "document",
+        }
+
+    def test_document_task(self):
+        task = get_task("document")
+        assert task.given == frozenset()
+        assert task.predicted == frozenset({"polarity"})
+        assert not task.is_classification  # extraction view: no aspect is given
 
     def test_acos_predicts_all_elements(self):
         assert get_task("acos").predicted == frozenset(ELEMENTS)
@@ -19,7 +35,7 @@ class TestRegistry:
         assert task.is_classification
 
     def test_extraction_tasks_are_not_classification(self):
-        for name in ("ate", "acd", "acsa", "e2e", "aste", "tasd", "acos"):
+        for name in ("ate", "acd", "acsa", "e2e", "aste", "tasd", "acos", "document"):
             assert not get_task(name).is_classification, name
 
 
@@ -36,6 +52,9 @@ class TestGetTask:
             ("E2E_ABSA", "e2e"),
             ("ACOS", "acos"),
             ("  aste  ", "aste"),
+            ("doc-sa", "document"),
+            ("document-sentiment", "document"),
+            ("docsa", "document"),
         ],
     )
     def test_aliases(self, alias, name):

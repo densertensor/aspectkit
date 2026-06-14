@@ -136,6 +136,14 @@ _REGISTRY: tuple[Task, ...] = (
         "(implicit aspects/opinions included)",
         aliases=("asqp", "quad", "quadruple"),
     ),
+    _task(
+        "document",
+        (),
+        ("polarity",),
+        "Document-level sentiment: the overall polarity of the whole text "
+        "(output tuple carries an implicit aspect)",
+        aliases=("docsa", "documentsentiment"),
+    ),
 )
 
 #: Registry of built-in tasks, keyed by canonical name.
