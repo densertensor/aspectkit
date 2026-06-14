@@ -1,0 +1,110 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aspectkit"
+version = "0.1.0"
+description = "A configurable, evaluation-centric framework for aspect-based sentiment analysis (ABSA)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "aspectkit contributors" }]
+keywords = [
+    "absa",
+    "aspect-based-sentiment-analysis",
+    "sentiment-analysis",
+    "opinion-mining",
+    "nlp",
+    "text-mining",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
+# The core library is dependency-free: the data model, loaders, evaluation,
+# aggregation, and prompt construction use only the standard library.
+# Model backends declare their requirements as optional extras below.
+dependencies = []
+
+[project.optional-dependencies]
+openai = ["openai>=1.40"]
+anthropic = ["anthropic>=0.34"]
+gemini = ["google-genai>=1.0"]
+transformers = ["transformers>=4.41", "torch>=2.1"]
+pandas = ["pandas>=2.0"]
+all = [
+    "openai>=1.40",
+    "anthropic>=0.34",
+    "google-genai>=1.0",
+    "transformers>=4.41",
+    "torch>=2.1",
+    "pandas>=2.0",
+]
+dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]
+
+[project.urls]
+Homepage = "https://github.com/densertensor/aspectkit"
+Repository = "https://github.com/densertensor/aspectkit"
+Issues = "https://github.com/densertensor/aspectkit/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aspectkit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: tests that download models or call external services (deselect with '-m \"not integration\"')",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "SIM", # simplify
+    "C4",  # comprehensions
+    "RUF", # ruff-specific
+]
+ignore = [
+    "SIM105", # contextlib.suppress is not always clearer than try/except/pass
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_unused_ignores = true
+no_implicit_optional = true
+files = ["src/aspectkit"]
+
+[[tool.mypy.overrides]]
+module = [
+    "pandas",
+    "openai",
+    "anthropic",
+    "google.*",
+    "torch",
+    "transformers",
+    "tokenizers.*",
+]
+ignore_missing_imports = true

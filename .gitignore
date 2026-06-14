@@ -1,0 +1,58 @@
+# --- private assets: API data, credentials, user-provided test fixtures ---
+# Anything that must never be published goes in these directories.
+/local/
+/assets/
+/private/
+/secrets/
+.env
+.env.*
+*.env
+*.key
+*.pem
+credentials*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+
+# --- virtual environments ---
+.venv/
+venv/
+env/
+
+# --- test / lint / type-check caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- model weights, datasets, experiment artifacts (heavy, non-source) ---
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.onnx
+.cache/
+hf_cache/
+wandb/
+runs/
+outputs/
+
+# --- editors / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- notebooks: keep sources, ignore checkpoints ---
+.ipynb_checkpoints/
