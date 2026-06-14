@@ -15,7 +15,7 @@ import json
 import random
 import threading
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any, Literal
@@ -31,6 +31,7 @@ from aspectkit.backends.prompts import (
 from aspectkit.exceptions import LLMError, ParseError
 from aspectkit.llm.base import ChatLLM, Message
 from aspectkit.llm.registry import resolve_llm
+from aspectkit.llm.wrappers import CachingChat, RetryingChat
 from aspectkit.schema import ABSAExample, SentimentTuple
 from aspectkit.tasks import Task, get_task
 
@@ -76,6 +77,17 @@ class LLMBackend(Backend):
             limits).  Prediction order is always preserved, and with
             ``on_error="raise"`` the first failure propagates.  The SDK
             clients behind the bundled connectors are thread-safe.
+        retry: Wrap the connector in
+            :class:`~aspectkit.llm.wrappers.RetryingChat` for configurable
+            rate-limit backoff.  ``True`` uses its defaults; a dict passes
+            keyword arguments (e.g. ``{"max_retries": 10}``).  Compose
+            wrappers manually for finer control.
+        cache_dir: Wrap the connector in
+            :class:`~aspectkit.llm.wrappers.CachingChat` with this
+            directory, so repeated inputs are served from disk.
+        on_progress: Optional ``(completed, total) -> None`` callback
+            invoked as each example finishes (called from worker threads
+            under concurrency, so it must be thread-safe).
         **llm_kwargs: Forwarded to the connector constructor when *llm*
             is a spec rather than an instance.
     """
@@ -94,6 +106,9 @@ class LLMBackend(Backend):
         max_repairs: int = 1,
         on_error: Literal["raise", "skip"] = "raise",
         concurrency: int = 1,
+        retry: bool | dict[str, Any] = False,
+        cache_dir: str | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
         **llm_kwargs: Any,
     ) -> None:
         if on_error not in ("raise", "skip"):
@@ -101,6 +116,12 @@ class LLMBackend(Backend):
         if concurrency < 1:
             raise ValueError(f"concurrency must be >= 1, got {concurrency}")
         self.llm: ChatLLM = resolve_llm(llm, **llm_kwargs)
+        # Optional composable wrappers (innermost first): cache, then retry.
+        if cache_dir is not None:
+            self.llm = CachingChat(self.llm, cache_dir=cache_dir)
+        if retry:
+            self.llm = RetryingChat(self.llm, **(retry if isinstance(retry, dict) else {}))
+        self.on_progress = on_progress
         self.task = get_task(task)
         self.categories = list(categories) if categories else None
         self.polarities = tuple(polarities)
@@ -152,11 +173,32 @@ class LLMBackend(Backend):
     def predict(self, examples: Sequence[ABSAExample]) -> list[list[SentimentTuple]]:
         self._require_given_elements(examples)
         self.diagnostics = {"calls": 0, "repairs": 0, "dropped_items": 0, "failed_examples": 0}
-        worker = self._classify_example if self.task.is_classification else self._extract_example
+        base = self._classify_example if self.task.is_classification else self._extract_example
+        worker = self._with_progress(base, len(examples)) if self.on_progress else base
         if self.concurrency == 1 or len(examples) <= 1:
             return [worker(example) for example in examples]
         with ThreadPoolExecutor(max_workers=min(self.concurrency, len(examples))) as pool:
             return list(pool.map(worker, examples))
+
+    def _with_progress(
+        self,
+        worker: Callable[[ABSAExample], list[SentimentTuple]],
+        total: int,
+    ) -> Callable[[ABSAExample], list[SentimentTuple]]:
+        """Wrap *worker* to report ``(completed, total)`` after each item."""
+        callback = self.on_progress
+        assert callback is not None  # only wrapped when on_progress is set
+        done = [0]
+
+        def tracked(example: ABSAExample) -> list[SentimentTuple]:
+            result = worker(example)
+            with self._diagnostics_lock:
+                done[0] += 1
+                completed = done[0]
+            callback(completed, total)
+            return result
+
+        return tracked
 
     # ------------------------------------------------------------- internals
 

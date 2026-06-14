@@ -22,15 +22,19 @@ from aspectkit.llm.gemini import GeminiChat
 from aspectkit.llm.local import TransformersChat
 from aspectkit.llm.openai import OpenAIChat
 from aspectkit.llm.registry import PROVIDERS, resolve_llm
+from aspectkit.llm.wrappers import CachingChat, CountingChat, RetryingChat
 
 __all__ = [
     "PROVIDERS",
     "AnthropicChat",
+    "CachingChat",
     "CallableChat",
     "ChatLLM",
+    "CountingChat",
     "GeminiChat",
     "Message",
     "OpenAIChat",
+    "RetryingChat",
     "TransformersChat",
     "resolve_llm",
     "split_system",

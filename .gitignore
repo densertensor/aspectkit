@@ -56,3 +56,6 @@ outputs/
 
 # --- notebooks: keep sources, ignore checkpoints ---
 .ipynb_checkpoints/
+
+# --- local working notes, not part of the package ---
+ctx/

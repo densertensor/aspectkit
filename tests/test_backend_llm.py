@@ -422,3 +422,29 @@ class TestIntrospection:
     def test_repr(self):
         backend = LLMBackend(FakeChat([]), task="acos")
         assert "acos" in repr(backend)
+
+
+class TestConvenienceKnobs:
+    def test_on_progress_called_per_example(self):
+        seen = []
+        llm = FakeChat(['{"tuples": []}', '{"tuples": []}'])
+        backend = LLMBackend(
+            llm, task="e2e", on_progress=lambda done, total: seen.append((done, total))
+        )
+        backend.predict([ABSAExample(text="a"), ABSAExample(text="b")])
+        assert seen == [(1, 2), (2, 2)]
+
+    def test_retry_and_cache_knobs_wrap_connector(self, tmp_path):
+        backend = LLMBackend(FakeChat([]), task="e2e", retry=True, cache_dir=str(tmp_path))
+        assert type(backend.llm).__name__ == "RetryingChat"  # outermost
+        assert type(backend.llm.inner).__name__ == "CachingChat"  # then cache
+        assert type(backend.llm.inner.inner).__name__ == "FakeChat"  # then connector
+
+    def test_retry_dict_configures_wrapper(self):
+        backend = LLMBackend(FakeChat([]), task="e2e", retry={"max_retries": 10})
+        assert type(backend.llm).__name__ == "RetryingChat"
+        assert backend.llm.max_retries == 10
+
+    def test_no_knobs_leaves_connector_bare(self):
+        llm = FakeChat([])
+        assert LLMBackend(llm, task="e2e").llm is llm
